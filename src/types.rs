@@ -92,6 +92,13 @@ impl Symbol {
 /// `module_len` is the total length the original library function had
 /// — informational; matching never reads more than what the
 /// constraints above require.
+///
+/// **Equality**: the derived `PartialEq` compares `names` as an ordered
+/// sequence, not a set. Two patterns with the same names in different
+/// order compare unequal. This is intentional — name ordering is
+/// preserved from the source `.pat` / `.sig` and is part of the
+/// pattern's identity — but if you're using `Pattern` as a `HashSet`
+/// key for de-duplication, normalise the names first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
     pub leading: Vec<PatternByte>,
@@ -193,6 +200,10 @@ impl FirstByteIndex {
             let i = i as u32;
             match pat.leading.first() {
                 Some(PatternByte::Byte(b)) => idx.buckets[*b as usize].push(i),
+                // `Wildcard` first byte → wildcards bucket (always
+                // scanned). `None` (empty leading) is filtered out at
+                // `FlirtSet::with_patterns`, so it shouldn't reach
+                // here — but defend with the same fallback.
                 Some(PatternByte::Wildcard) | None => idx.wildcards.push(i),
             }
         }
@@ -208,7 +219,19 @@ impl FlirtSet {
         }
     }
 
+    /// Construct a [`FlirtSet`] from a pre-built pattern list.
+    ///
+    /// Patterns with an empty `leading` field are silently dropped —
+    /// FLIRT signatures require at least one head byte, and admitting
+    /// them would match almost any input (the head check trivially
+    /// passes against a zero-length pattern). If you need to round-
+    /// trip such patterns for inspection, hold them in your own
+    /// container outside `FlirtSet`.
     pub fn with_patterns(patterns: Vec<Pattern>) -> Self {
+        let patterns: Vec<Pattern> = patterns
+            .into_iter()
+            .filter(|p| !p.leading.is_empty())
+            .collect();
         let index = FirstByteIndex::build(&patterns);
         Self { patterns, index }
     }

@@ -53,21 +53,26 @@ impl FlirtSet {
     /// single corpus. Files are recognised by extension
     /// (case-insensitive).
     ///
+    /// Symlinks (both file and directory) are deliberately skipped to
+    /// avoid loops and to keep the trust boundary clear — if you want
+    /// to follow symlinks, canonicalise the directory yourself.
+    ///
     /// Fails fast on the first malformed file. Callers that want
     /// lenient loading should iterate the directory themselves and
-    /// call `pat::parse` / `sig::parse` per file.
+    /// call `pat::parse` / `sig::parse` per file. Errors include the
+    /// path they originated on (no more opaque `Truncated(0,0)`).
     pub fn load_dir<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let mut patterns = Vec::new();
         for entry in walkdir(dir.as_ref())? {
+            let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_lowercase();
             if name.ends_with(".pat") {
-                let text = std::fs::read_to_string(entry.path())
-                    .map_err(|e| Error::Truncated(0, 0).context_io(format!("{}: {}", name, e)))?;
+                let text =
+                    std::fs::read_to_string(&path).map_err(|e| Error::Io(path.clone(), e))?;
                 let mut p = pat::parse(&text)?;
                 patterns.append(&mut p);
             } else if name.ends_with(".sig") {
-                let bytes = std::fs::read(entry.path())
-                    .map_err(|e| Error::Truncated(0, 0).context_io(format!("{}: {}", name, e)))?;
+                let bytes = std::fs::read(&path).map_err(|e| Error::Io(path.clone(), e))?;
                 let mut p = sig::parse(&bytes)?;
                 patterns.append(&mut p);
             }
@@ -76,34 +81,32 @@ impl FlirtSet {
     }
 }
 
-// Minimal recursive directory walker — we don't pull `walkdir` here
-// because std::fs::read_dir + a vec stack does the job in 15 lines
-// and avoids an extra dep. The standard `walkdir` crate is overkill
-// for what we need (no symlink handling, no max-depth, no filtering
-// at traversal time).
+/// Recursive directory walker. Skips symlinks (both file + directory)
+/// so a symlink loop in the input tree can't OOM us, and surfaces real
+/// IO errors via [`Error::Io`] with the offending path attached.
 fn walkdir(root: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        let read_dir = std::fs::read_dir(&path).map_err(|_| Error::Truncated(0, 0))?;
-        for entry in read_dir.flatten() {
+        let read_dir = std::fs::read_dir(&path).map_err(|e| Error::Io(path.clone(), e))?;
+        for entry in read_dir {
+            let entry = entry.map_err(|e| Error::Io(path.clone(), e))?;
+            // Skip symlinks unconditionally. `file_type` is cheap on
+            // every platform (no extra syscall on Unix; pre-cached on
+            // Windows). A failure here surfaces with the entry path.
+            let ft = entry.file_type().map_err(|e| Error::Io(entry.path(), e))?;
+            if ft.is_symlink() {
+                continue;
+            }
             let p = entry.path();
-            if p.is_dir() {
+            if ft.is_dir() {
                 stack.push(p);
-            } else {
+            } else if ft.is_file() {
                 out.push(entry);
             }
+            // Sockets, fifos, block devices etc. silently ignored —
+            // they're not signature files.
         }
     }
     Ok(out)
-}
-
-// Sketch helper for adding I/O context to an error without pulling
-// `anyhow`. Used only in `load_dir` for the moment.
-impl Error {
-    fn context_io(self, _msg: String) -> Self {
-        // 0.1: keep errors thin. We can surface the IO message via a
-        // dedicated variant if it turns out to matter for diagnostics.
-        self
-    }
 }

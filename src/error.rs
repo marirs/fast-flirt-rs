@@ -1,5 +1,7 @@
 //! Error type for fast-flirt.
 
+use std::path::PathBuf;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("truncated input at offset {0}: expected {1} more bytes")]
@@ -13,6 +15,13 @@ pub enum Error {
 
     #[error("zlib inflate failed: {0}")]
     Inflate(String),
+
+    /// The compressed body would have inflated beyond [`MAX_INFLATED`].
+    /// Defends against zlib bombs from untrusted `.sig` input.
+    ///
+    /// [`MAX_INFLATED`]: crate::sig::MAX_INFLATED
+    #[error("inflated .sig body would exceed {limit} bytes (bomb defence)")]
+    InflateBomb { limit: usize },
 
     #[error("malformed .pat line {0}: {1}")]
     BadPatLine(usize, &'static str),
@@ -38,8 +47,42 @@ pub enum Error {
     #[error("wildcard mask exceeds supported width (>64 bits) at offset {0}")]
     MaskTooWide(usize),
 
+    /// A wildcard-mask declared more set bits than the pattern's length.
+    /// Indicates corruption or a hostile `.sig` — fail loud rather than
+    /// silently truncating the literal slice.
+    #[error("wildcard mask popcount {popcount} exceeds length {length} at offset {pos}")]
+    BadMask {
+        pos: usize,
+        length: u16,
+        popcount: u32,
+    },
+
+    /// `.sig` trie recursion exceeded the configured depth limit. Real
+    /// FLIRT trees are shallow (<32 in practice); the cap defends
+    /// against stack-overflow DoS from crafted input.
+    #[error("`.sig` trie depth exceeded the {limit}-node limit at offset {pos}")]
+    TooDeep { pos: usize, limit: u32 },
+
+    /// A wire-encoded count (children per node, modules per CRC group,
+    /// tail-bytes per module, …) was too large to be plausible given
+    /// the remaining input. Defends against allocation DoS.
+    #[error("implausible count {count} at offset {pos} (max {max})")]
+    ImplausibleCount { pos: usize, count: u64, max: usize },
+
+    /// A `.sig`-encoded function size exceeded `u32::MAX`. `module_len`
+    /// is `u32` in our model; truncating silently would mis-report the
+    /// size for hostile input, so we error explicitly.
+    #[error("module_len {size} exceeds u32::MAX at offset {pos}")]
+    ModuleLenOverflow { pos: usize, size: u64 },
+
     #[error("trailing data after .sig parse at offset {0}: {1} bytes remain")]
     TrailingData(usize, usize),
+
+    /// IO error while loading a signature file. Preserves the path so
+    /// callers get a useful "permission denied on /sigs/foo.sig" instead
+    /// of an opaque parse error.
+    #[error("io error on {0}: {1}")]
+    Io(PathBuf, #[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

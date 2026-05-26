@@ -55,6 +55,33 @@ const FEATURE_COMPRESSED: u16 = 0x10;
 /// understand and we'd rather fail loud than skip data.
 const ALL_FEATURES: u16 = 0x3F;
 
+// -----------------------------------------------------------------
+// DoS-defence caps (0.1.1)
+// -----------------------------------------------------------------
+//
+// FLIRT `.sig` files come from untrusted sources (FLAIR, third-party
+// corpora, samples in malware-analysis pipelines). Every wire-encoded
+// count or recursion path needs a plausibility cap so a hand-crafted
+// file can't blow the stack or exhaust memory.
+
+/// Maximum bytes the decompressed body may occupy. Real FLIRT corpora
+/// (the published Hex-Rays bundles + FLIRTDB) are well under 100 MiB
+/// inflated; 256 MiB leaves headroom for unusually large libraries
+/// while still blocking zlib bombs cold.
+pub const MAX_INFLATED: usize = 256 * 1024 * 1024;
+
+/// Maximum depth of the `.sig` trie. Real trees in FLIRTDB are
+/// shallow (typically <16, never >32 in the 192-file sweep we tested
+/// against during 0.1.0). 256 leaves comfortable headroom while
+/// killing crafted "chain of single-child nodes" stack-overflow input.
+const MAX_TRIE_DEPTH: u32 = 256;
+
+/// Hard ceiling on any single wire-encoded count (children per node,
+/// modules per CRC group, tail-bytes per module, etc.). 1 << 20 is
+/// orders of magnitude larger than anything observed in practice and
+/// stops `for _ in 0..count { Vec::push(...) }` DoS amplifiers.
+const MAX_COUNT: usize = 1 << 20;
+
 #[derive(Debug, Clone, Copy)]
 struct Header {
     version: u8,
@@ -169,9 +196,15 @@ fn vint32(cur: &mut Cursor<'_>) -> Result<u32> {
         return Ok(((b as u32 & 0x7F) << 8) | low);
     }
     if (b & 0xE0) != 0xE0 {
+        // 4-byte form `110xxxxx`: top 3 bits are the discriminator,
+        // bottom 5 bits are payload. Bit 5 is always 0 in this
+        // branch (the 5-byte branch below would have fired
+        // otherwise), so `& 0x1F` and `& 0x3F` give the same numeric
+        // result today — `& 0x1F` is the self-documenting choice
+        // that survives any future re-ordering of the branches.
         let mid = cur.u8()? as u32;
         let low = cur.be_u16()? as u32;
-        return Ok((((b as u32 & 0x3F) << 8 | mid) << 16) | low);
+        return Ok((((b as u32 & 0x1F) << 8 | mid) << 16) | low);
     }
     let hi = cur.be_u16()? as u32;
     let lo = cur.be_u16()? as u32;
@@ -307,16 +340,35 @@ const NFLAG_ALL: u8 = 0x1F;
 
 /// Recurse into a trie node, appending discovered patterns to `out`.
 /// `prefix` is the head pattern bytes accumulated by parent nodes.
+///
+/// `depth` is the current trie depth (0 at the root). We refuse to
+/// recurse beyond [`MAX_TRIE_DEPTH`] to defend against stack-overflow
+/// DoS from crafted "chain of single-child nodes" input — real FLIRT
+/// trees are shallow (<32 in the FLIRTDB corpus).
 fn parse_node(
     cur: &mut Cursor<'_>,
     header: &Header,
     prefix: &mut Vec<PatternByte>,
     out: &mut Vec<Pattern>,
+    depth: u32,
 ) -> Result<()> {
+    if depth >= MAX_TRIE_DEPTH {
+        return Err(Error::TooDeep {
+            pos: cur.pos,
+            limit: MAX_TRIE_DEPTH,
+        });
+    }
+
     let child_count = vint16(cur)?;
     if child_count == 0 {
         return parse_leaf(cur, header, prefix, out);
     }
+
+    // Cap child_count against remaining input: every child consumes at
+    // least one byte for its length field, plus mask/literals/child
+    // subtree. A count larger than `cur.remaining()` is provably
+    // implausible regardless of how cheap each child encodes.
+    let child_count = bound_count(child_count as u64, cur)?;
 
     for _ in 0..child_count {
         // Each child contributes `length` more bytes to the pattern
@@ -327,7 +379,20 @@ fn parse_node(
             vint16(cur)?
         };
         let mask = wildcard_mask(cur, length)?;
-        let literal_count = length - mask.count_ones() as u16;
+
+        // Defence: a hostile mask could claim more set bits than the
+        // pattern length. Without this check the u16 subtraction
+        // panics in debug builds and wraps to a huge number in
+        // release, then drives a doomed `take()`.
+        let popcount = mask.count_ones();
+        if popcount as u64 > length as u64 {
+            return Err(Error::BadMask {
+                pos: cur.pos,
+                length,
+                popcount,
+            });
+        }
+        let literal_count = length - popcount as u16;
         let literals = cur.take(literal_count as usize)?;
 
         // Expand mask + literals into the prefix. FLIRT packs literals
@@ -348,13 +413,30 @@ fn parse_node(
         }
         prefix[prev_len..].reverse();
 
-        parse_node(cur, header, prefix, out)?;
+        parse_node(cur, header, prefix, out, depth + 1)?;
 
         // Pop our contribution before the next sibling.
         prefix.truncate(prev_len);
     }
 
     Ok(())
+}
+
+/// Clamp a wire-encoded count against both a hard ceiling
+/// ([`MAX_COUNT`]) and the remaining input length, surfacing
+/// [`Error::ImplausibleCount`] when either bound is exceeded. Used
+/// for child-counts, modules-per-leaf, tail-byte counts, and
+/// referenced-name counts.
+fn bound_count(count: u64, cur: &Cursor<'_>) -> Result<usize> {
+    let max = MAX_COUNT.min(cur.remaining());
+    if count > max as u64 {
+        return Err(Error::ImplausibleCount {
+            pos: cur.pos,
+            count,
+            max,
+        });
+    }
+    Ok(count as usize)
 }
 
 /// Parse a leaf — one or more "modules" (functions) that share the
@@ -396,11 +478,12 @@ fn parse_leaf(
             // (or implicit 1 for v<8), then `count` × (offset_vword,
             // value_u8).
             if (pflags & PFLAG_TAIL_BYTES) != 0 {
-                let count = if header.version < 8 {
+                let count_raw = if header.version < 8 {
                     1u64
                 } else {
                     vword(cur, header.version)?
                 };
+                let count = bound_count(count_raw, cur)?;
                 for _ in 0..count {
                     let off = vword(cur, header.version)?;
                     let val = cur.u8()?;
@@ -419,13 +502,21 @@ fn parse_leaf(
             // pattern; the matcher caller decides what to do with
             // them (full resolution requires recursive matching).
             if (pflags & PFLAG_REFERENCED_FUNCTIONS) != 0 {
-                let count = if header.version < 8 {
+                let count_raw = if header.version < 8 {
                     1u64
                 } else {
                     vword(cur, header.version)?
                 };
+                let count = bound_count(count_raw, cur)?;
                 for _ in 0..count {
                     let off = vword(cur, header.version)?;
+                    // Defensive: keep the same u32::MAX bound as
+                    // tail_bytes. Today this is unreachable because
+                    // `vword` is capped at u32::MAX, but if the
+                    // varint widens in future the check stays valid.
+                    if off > u32::MAX as u64 {
+                        return Err(Error::VarintOverflow(cur.pos));
+                    }
                     let size_byte = cur.u8()?;
                     // size == 0 → extended length stored as vint16.
                     let size: u16 = if size_byte == 0 {
@@ -442,6 +533,15 @@ fn parse_leaf(
                 }
             }
 
+            // Reject silently-truncating module_len. Real libraries
+            // are well under 4 GiB; a wire value above u32::MAX means
+            // the file is either corrupt or hostile.
+            if function_size > u32::MAX as u64 {
+                return Err(Error::ModuleLenOverflow {
+                    pos: cur.pos,
+                    size: function_size,
+                });
+            }
             out.push(Pattern {
                 leading: prefix.to_vec(),
                 crc_len,
@@ -521,6 +621,11 @@ fn parse_name(cur: &mut Cursor<'_>, version: u8, base_offset: i64) -> Result<(Sy
 /// Parse a complete `.sig` file (compressed or not) into a list of
 /// patterns. The header is parsed first; if the `COMPRESSED` feature
 /// bit is set, the body is zlib-inflated before trie traversal.
+///
+/// Inflation is capped at [`MAX_INFLATED`] bytes. A `.sig` whose
+/// compressed body would exceed that limit returns
+/// [`Error::InflateBomb`] without ever materialising the output —
+/// defence against zlib decompression bombs on untrusted input.
 pub fn parse(input: &[u8]) -> Result<Vec<Pattern>> {
     let header = parse_header(input)?;
 
@@ -530,8 +635,22 @@ pub fn parse(input: &[u8]) -> Result<Vec<Pattern>> {
     let body_owned: Vec<u8>;
     let body: &[u8] = if header.is_compressed() {
         let compressed = &input[header.header_len..];
-        body_owned = miniz_oxide::inflate::decompress_to_vec_zlib(compressed)
-            .map_err(|e| Error::Inflate(format!("{:?}", e)))?;
+        body_owned =
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(compressed, MAX_INFLATED)
+                .map_err(|e| {
+                    // `TINFLStatus::HasMoreOutput` is the specific status the
+                    // limit-form of the API returns when the cap is hit. Other
+                    // statuses (CRC mismatch, bad header, truncated stream)
+                    // are wire-corruption errors — surface them under Inflate.
+                    use miniz_oxide::inflate::TINFLStatus;
+                    if e.status == TINFLStatus::HasMoreOutput {
+                        Error::InflateBomb {
+                            limit: MAX_INFLATED,
+                        }
+                    } else {
+                        Error::Inflate(format!("{:?}", e.status))
+                    }
+                })?;
         &body_owned
     } else {
         &input[header.header_len..]
@@ -540,7 +659,7 @@ pub fn parse(input: &[u8]) -> Result<Vec<Pattern>> {
     let mut cur = Cursor::new(body);
     let mut prefix = Vec::with_capacity(header.pattern_size as usize);
     let mut out = Vec::new();
-    parse_node(&mut cur, &header, &mut prefix, &mut out)?;
+    parse_node(&mut cur, &header, &mut prefix, &mut out, 0)?;
     // We don't enforce zero trailing bytes — some `.sig` files have a
     // few bytes of padding that aren't part of the formal grammar
     // (probably alignment in the FLAIR writer). If we ever want
@@ -640,5 +759,38 @@ mod tests {
         // Just the magic — definitely too short.
         let err = parse(b"IDASGN").unwrap_err();
         assert!(matches!(err, Error::Truncated(_, _)));
+    }
+
+    // -----------------------------------------------------------
+    // 0.1.1 hardening tests: confirm the new validation paths fire
+    // on the inputs they're meant to reject. We construct minimal
+    // synthetic bytes that exercise one guard each.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn bound_count_rejects_oversize() {
+        let buf = [0u8; 16];
+        let cur = Cursor { buf: &buf, pos: 0 };
+        // Hard ceiling: 1 << 20. Anything above that, regardless of
+        // remaining, fails.
+        let err = bound_count(2_000_000, &cur).unwrap_err();
+        assert!(matches!(err, Error::ImplausibleCount { .. }));
+    }
+
+    #[test]
+    fn bound_count_rejects_more_than_remaining() {
+        let buf = [0u8; 4];
+        let cur = Cursor { buf: &buf, pos: 0 };
+        // Below the hard ceiling but more than `cur.remaining()`.
+        let err = bound_count(100, &cur).unwrap_err();
+        assert!(matches!(err, Error::ImplausibleCount { .. }));
+    }
+
+    #[test]
+    fn bound_count_accepts_in_range() {
+        let buf = [0u8; 64];
+        let cur = Cursor { buf: &buf, pos: 0 };
+        assert_eq!(bound_count(8, &cur).unwrap(), 8);
+        assert_eq!(bound_count(0, &cur).unwrap(), 0);
     }
 }
