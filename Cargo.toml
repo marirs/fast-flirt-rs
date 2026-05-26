@@ -1,0 +1,35 @@
+[package]
+name = "fast-flirt"
+version = "0.1.0"
+description = "Fast, thread-safe FLIRT (Fast Library Identification and Recognition Technology) signature parser and matcher."
+authors = ["Marirs <marirs@gmail.com>"]
+keywords = ["flirt", "flare", "malware", "reverse-engineering", "signatures"]
+categories = ["parsing"]
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/marirs/fast-flirt-rs"
+homepage = "https://github.com/marirs/fast-flirt-rs"
+edition = "2024"
+rust-version = "1.95"
+exclude = ["data", "tests/fixtures"]
+
+[dependencies]
+# zlib decompression for `.sig` files that carry the
+# `IDASGN_FEATURE_COMPRESSED` flag — almost all of them.
+# miniz_oxide is pure Rust and ~1/4 the binary size of `flate2 +
+# libz-sys` because there's no C dep.
+miniz_oxide = "0.9"
+# inlined small `Vec` for the per-pattern names list (typical
+# patterns have 1 name; some have 2-3).
+smallvec = "1"
+# error type derives.
+thiserror = "2"
+
+[lib]
+name = "fast_flirt"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
