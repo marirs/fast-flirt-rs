@@ -11,7 +11,7 @@ repository = "https://github.com/marirs/fast-flirt-rs"
 homepage = "https://github.com/marirs/fast-flirt-rs"
 edition = "2024"
 rust-version = "1.95"
-exclude = ["data", "tests/fixtures"]
+exclude = ["data", "tests/fixtures", "fuzz", "examples"]
 
 [dependencies]
 # zlib decompression for `.sig` files that carry the

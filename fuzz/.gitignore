@@ -1,0 +1,5 @@
+# cargo-fuzz workspace
+target/
+corpus/
+artifacts/
+coverage/

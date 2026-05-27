@@ -1,0 +1,44 @@
+# cargo-fuzz target crate. NOT published to crates.io — the parent
+# fast-flirt Cargo.toml lists `fuzz` in `exclude`. To run:
+#
+#   cargo install cargo-fuzz
+#   cargo fuzz run sig_parse
+#   cargo fuzz run pat_parse
+#
+# Both targets accept arbitrary bytes and ensure the parser never
+# panics. Any crash dumped to fuzz/artifacts/ is a real bug — file
+# it with the input as a regression test fixture.
+
+[package]
+name = "fast-flirt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.fast-flirt]
+path = ".."
+
+# Each fuzz target compiles to its own binary. `test = false` and
+# `bench = false` keep `cargo test`/`cargo bench` in this directory
+# from accidentally trying to run them (libfuzzer-sys targets need
+# their own runtime).
+
+[[bin]]
+name = "sig_parse"
+path = "fuzz_targets/sig_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pat_parse"
+path = "fuzz_targets/pat_parse.rs"
+test = false
+doc = false
+bench = false

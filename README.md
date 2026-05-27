@@ -139,7 +139,29 @@ fast_flirt::crc16(&[u8]) -> u16   // CRC-16/X-25
 ## Requirements
 
 - Rust **1.95** or newer (2024 edition).
-- No C/C++ toolchain required — pure Rust.
+
+## Benchmark
+
+End-to-end benchmark (load + match) lives in `examples/bench.rs`:
+
+```bash
+cargo run --release --example bench -- ../FLIRTDB
+cargo run --release --example bench -- ../FLIRTDB ../some-sample.exe
+```
+
+The first form reports `load_dir` time + corpus stats. The second additionally sweeps the matcher across the sample's bytes and reports `matches()` / `match_public_name()` throughput.
+
+## Fuzzing
+
+Two `cargo fuzz` targets live in `fuzz/`. They feed arbitrary bytes to the parsers and assert that no input ever panics:
+
+```bash
+cargo install cargo-fuzz
+cargo fuzz run sig_parse
+cargo fuzz run pat_parse
+```
+
+Crashing inputs land in `fuzz/artifacts/<target>/` — file each one as a regression fixture before patching. The fuzz crate is excluded from the published `.crate` and adds no runtime dependencies.
 
 ## Used by
 
