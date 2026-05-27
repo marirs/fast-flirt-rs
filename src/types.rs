@@ -1,7 +1,7 @@
 //! Core data model for FLIRT signatures — zero-copy edition.
 //!
 //! Every signature in a [`FlirtSet`] lives inside one owned byte arena
-//! (`Box<[u8]>`). The set keeps a fixed-size 48-byte [`PatternData`]
+//! (`Box<[u8]>`). The set keeps a fixed-size 48-byte `PatternData`
 //! record per pattern with offsets into that arena. Callers iterate
 //! via [`Pattern`] handles — lightweight `Copy` values that hold a
 //! `(&FlirtSet, pattern_index)` pair and resolve fields on access.
@@ -43,7 +43,8 @@ pub(crate) struct PatternData {
     pub(crate) module_len: u32,
 
     // ---- names ---------------------------------------------------
-    /// Offset of the packed name records (see [`name_records`]).
+    /// Offset of the packed name records (laid out as documented on
+    /// `NameIter`).
     pub(crate) names_off: u32,
     pub(crate) names_count: u8,
 
@@ -343,7 +344,7 @@ impl FlirtSet {
 
     /// Borrow every pattern in the set. Mostly useful for tests +
     /// introspection — match-time queries should go through
-    /// [`Self::matches`].
+    /// `FlirtSet::matches`.
     pub fn patterns(&self) -> impl Iterator<Item = Pattern<'_>> + '_ {
         (0..self.patterns.len() as u32).map(move |i| Pattern::new(self, i))
     }
@@ -498,7 +499,7 @@ impl FlirtSetBuilder {
         off
     }
 
-    /// Push a fully-constructed [`PatternData`]. Returns its index in
+    /// Push a fully-constructed `PatternData`. Returns its index in
     /// `patterns`.
     pub(crate) fn push_pattern(&mut self, data: PatternData) -> usize {
         self.patterns.push(data);

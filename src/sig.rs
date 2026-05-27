@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The body is a recursive trie. The parser walks it, accumulating a
-//! head prefix as it descends, and emits one [`PatternData`] per
+//! head prefix as it descends, and emits one `PatternData` per
 //! "module" (function) at each leaf. Names and tail-byte
 //! discriminators flow into the [`FlirtSetBuilder`]'s arena.
 //!

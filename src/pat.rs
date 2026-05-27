@@ -74,9 +74,9 @@ pub(crate) fn append(builder: &mut FlirtSetBuilder, text: &str) -> Result<usize>
     Ok(count)
 }
 
-/// Parse one `.pat` line and push the resulting [`PatternData`] onto
+/// Parse one `.pat` line and push the resulting `PatternData` onto
 /// `builder`. All hex / wildcard bytes flow into the builder's arena
-/// in the layout described on [`crate::types::PatternData`].
+/// in the layout documented on `crate::types::PatternData`.
 fn parse_line_into(builder: &mut FlirtSetBuilder, line: &str, line_no: usize) -> Result<()> {
     let mut toks = line.split_ascii_whitespace();
 
