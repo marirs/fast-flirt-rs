@@ -83,6 +83,43 @@ pub enum Error {
     /// of an opaque parse error.
     #[error("io error on {0}: {1}")]
     Io(PathBuf, #[source] std::io::Error),
+
+    /// `FlirtSetBuilder::alloc*` would have pushed past the 4 GiB
+    /// `u32` offset ceiling. Reachable only when accumulating
+    /// extremely large signature corpora into a single set; defends
+    /// against silent offset wrap that would corrupt every later
+    /// pattern lookup.
+    #[error(
+        "arena overflow: cannot fit {requested} more bytes (current arena {current} bytes, cap {})",
+        u32::MAX
+    )]
+    ArenaOverflow { current: usize, requested: usize },
+
+    /// A `PatternData` record points at arena bytes that are outside
+    /// the arena. Validated at `FlirtSetBuilder::build` time; should
+    /// never fire from the bundled parsers, but defends against
+    /// future producers / corrupt round-trips.
+    #[error(
+        "pattern {pattern_idx}: arena bounds violation — field {field} at offset {offset} length {length} exceeds arena length {arena_len}"
+    )]
+    ArenaBounds {
+        pattern_idx: usize,
+        field: &'static str,
+        offset: u32,
+        length: usize,
+        arena_len: usize,
+    },
+
+    /// Too many names attached to one signature (limit: `u16::MAX`).
+    /// Real FLIRT signatures have a handful; this defends against
+    /// crafted `.sig` input that would silently saturate.
+    #[error("too many names on pattern at offset {pos} (max {max})")]
+    TooManyNames { pos: usize, max: u16 },
+
+    /// Too many discrete tail-byte discriminators on one signature
+    /// (limit: `u32::MAX`). See `TooManyNames`.
+    #[error("too many tail_bytes on pattern at offset {pos} (max {max})")]
+    TooManyTailBytes { pos: usize, max: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

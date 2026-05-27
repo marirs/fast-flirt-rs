@@ -356,7 +356,7 @@ fn parse_leaf(
     // leaf. Every module under this leaf shares the same head bytes
     // and wildcard mask, so the alloc is amortised.
     let (leading_bytes, leading_mask) = materialise_prefix(prefix);
-    let leading_off = builder.alloc(&leading_bytes);
+    let leading_off = builder.alloc(&leading_bytes)?;
     let leading_len = leading_bytes.len() as u8;
 
     loop {
@@ -366,11 +366,16 @@ fn parse_leaf(
         let last_pflags: u8 = loop {
             let function_size = vword(cur, header.version)?;
 
-            // Name parsing. Names land in the arena directly; we track
-            // names_off (the offset of the first name record) and
-            // names_count for the eventual PatternData.
+            // Name parsing. Public names land in the arena directly;
+            // names_off captures the offset of the first record.
+            // Reference names are STAGED first (see below) so they
+            // can be appended to the same contiguous run after we've
+            // consumed the wire-mandated tail_bytes section — without
+            // that staging, tail_byte records would sit between the
+            // public names and the references, breaking NameIter's
+            // contiguous-records assumption.
             let mut names_off: u32 = 0;
-            let mut names_count: u8 = 0;
+            let mut names_count: u16 = 0;
             let mut current_offset: i64 = 0;
 
             let pflags: u8 = loop {
@@ -378,19 +383,26 @@ fn parse_leaf(
                     parse_name(cur, header.version, current_offset)?;
                 current_offset = new_offset;
                 let name = std::str::from_utf8(name_bytes)?;
-                let off = builder.alloc_name(kind, new_offset, name);
+                let off = builder.alloc_name(kind, new_offset, name)?;
                 if names_count == 0 {
                     names_off = off;
                 }
-                names_count = names_count.saturating_add(1);
+                names_count = names_count.checked_add(1).ok_or(Error::TooManyNames {
+                    pos: cur.pos,
+                    max: u16::MAX,
+                })?;
                 if (flags & PFLAG_MORE_PUBLIC_NAMES) == 0 {
                     break flags;
                 }
             };
 
-            // Optional tail-byte discriminators.
-            let mut tail_bytes_off: u32 = 0;
-            let mut tail_bytes_count: u16 = 0;
+            // Wire-format: tail-byte discriminators come FIRST on the
+            // wire, then references. Arena-format: references must be
+            // contiguous with the public names (NameIter walks one
+            // back-to-back run). So we *stage* tail-byte values now,
+            // alloc references next, then flush the staged tail
+            // bytes into a contiguous run of their own.
+            let mut staged_tail_bytes: Vec<(u32, u8)> = Vec::new();
             if (pflags & PFLAG_TAIL_BYTES) != 0 {
                 let count_raw = if header.version < 8 {
                     1u64
@@ -398,22 +410,19 @@ fn parse_leaf(
                     vword(cur, header.version)?
                 };
                 let count = bound_count(count_raw, cur)?;
-                for i in 0..count {
+                for _ in 0..count {
                     let off = vword(cur, header.version)?;
                     let val = cur.u8()?;
                     if off > u32::MAX as u64 {
                         return Err(Error::VarintOverflow(cur.pos));
                     }
-                    let rec_off = builder.alloc_tail_byte(off as u32, val);
-                    if i == 0 {
-                        tail_bytes_off = rec_off;
-                    }
-                    tail_bytes_count = tail_bytes_count.saturating_add(1);
+                    staged_tail_bytes.push((off as u32, val));
                 }
             }
 
-            // Optional referenced functions. Surfaced as Reference
-            // names appended to this module's name list.
+            // References → arena-allocated as Reference names,
+            // immediately after the public names so the whole names
+            // run stays contiguous.
             if (pflags & PFLAG_REFERENCED_FUNCTIONS) != 0 {
                 let count_raw = if header.version < 8 {
                     1u64
@@ -434,12 +443,34 @@ fn parse_leaf(
                     };
                     let name_bytes = cur.take(size as usize)?;
                     let name = std::str::from_utf8(name_bytes)?;
-                    let rec_off = builder.alloc_name(NK_REFERENCE, off as i64, name);
+                    let rec_off = builder.alloc_name(NK_REFERENCE, off as i64, name)?;
                     if names_count == 0 {
                         names_off = rec_off;
                     }
-                    names_count = names_count.saturating_add(1);
+                    names_count = names_count.checked_add(1).ok_or(Error::TooManyNames {
+                        pos: cur.pos,
+                        max: u16::MAX,
+                    })?;
                 }
+            }
+
+            // Now flush the staged tail-byte records as their own
+            // contiguous run. `tail_bytes_off` points at the first
+            // record.
+            let mut tail_bytes_off: u32 = 0;
+            let mut tail_bytes_count: u32 = 0;
+            for (i, (tb_off, tb_val)) in staged_tail_bytes.iter().enumerate() {
+                let rec_off = builder.alloc_tail_byte(*tb_off, *tb_val)?;
+                if i == 0 {
+                    tail_bytes_off = rec_off;
+                }
+                tail_bytes_count =
+                    tail_bytes_count
+                        .checked_add(1)
+                        .ok_or(Error::TooManyTailBytes {
+                            pos: cur.pos,
+                            max: u32::MAX,
+                        })?;
             }
 
             if function_size > u32::MAX as u64 {
@@ -557,7 +588,7 @@ fn parse_name<'a>(
 pub fn parse(input: &[u8]) -> Result<FlirtSet> {
     let mut builder = FlirtSetBuilder::new();
     append(&mut builder, input)?;
-    Ok(builder.build())
+    builder.build()
 }
 
 /// Internal: parse `input` and push its patterns onto `builder`'s

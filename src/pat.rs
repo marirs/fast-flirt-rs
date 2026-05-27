@@ -40,7 +40,7 @@ use crate::types::{FlirtSet, FlirtSetBuilder, NK_LOCAL, NK_PUBLIC, NK_REFERENCE,
 pub fn parse(text: &str) -> Result<FlirtSet> {
     let mut builder = FlirtSetBuilder::new();
     append(&mut builder, text)?;
-    Ok(builder.build())
+    builder.build()
 }
 
 /// Internal: parse `text` and push its patterns onto `builder`'s
@@ -88,7 +88,7 @@ fn parse_line_into(builder: &mut FlirtSetBuilder, line: &str, line_no: usize) ->
         return Err(Error::BadPatLine(line_no, "head pattern not 64 chars"));
     }
     let (head_bytes, head_mask) = decode_pattern_str(head_tok, line_no)?;
-    let leading_off = builder.alloc(&head_bytes);
+    let leading_off = builder.alloc(&head_bytes)?;
     let leading_len = head_bytes.len() as u8;
 
     // 2-4. CRC length, CRC16, module length.
@@ -114,8 +114,13 @@ fn parse_line_into(builder: &mut FlirtSetBuilder, line: &str, line_no: usize) ->
     // Track it as the offset of the first allocation; subsequent
     // names extend the contiguous block. Bytes between are nothing —
     // alloc_name pushes records back-to-back.
+    // `.pat` has a simpler arena interleaving than `.sig`: all
+    // names (public + reference, in source order) come BEFORE the
+    // optional tail token, so the contiguous-names invariant holds
+    // naturally. We allocate names directly, then (if present) the
+    // tail pattern.
     let mut names_off: u32 = 0;
-    let mut names_count: u8 = 0;
+    let mut names_count: u16 = 0;
     let mut tail_off: u32 = 0;
     let mut tail_len: u8 = 0;
     let mut tail_mask: u64 = 0;
@@ -127,25 +132,31 @@ fn parse_line_into(builder: &mut FlirtSetBuilder, line: &str, line_no: usize) ->
                 .next()
                 .ok_or(Error::BadPatLine(line_no, "missing name after `:OFFSET`"))?;
             let kind = if is_static { NK_LOCAL } else { NK_PUBLIC };
-            let off = builder.alloc_name(kind, offset, name_str);
+            let off = builder.alloc_name(kind, offset, name_str)?;
             if names_count == 0 {
                 names_off = off;
             }
-            names_count = names_count.saturating_add(1);
+            names_count = names_count.checked_add(1).ok_or(Error::TooManyNames {
+                pos: 0,
+                max: u16::MAX,
+            })?;
         } else if let Some(rest) = tok.strip_prefix('^') {
             let (offset, _) = parse_name_offset(rest, line_no)?;
             let name_str = toks
                 .next()
                 .ok_or(Error::BadPatLine(line_no, "missing name after `^OFFSET`"))?;
-            let off = builder.alloc_name(NK_REFERENCE, offset, name_str);
+            let off = builder.alloc_name(NK_REFERENCE, offset, name_str)?;
             if names_count == 0 {
                 names_off = off;
             }
-            names_count = names_count.saturating_add(1);
+            names_count = names_count.checked_add(1).ok_or(Error::TooManyNames {
+                pos: 0,
+                max: u16::MAX,
+            })?;
         } else {
             // Tail pattern (last token).
             let (bytes, mask) = decode_pattern_str(tok, line_no)?;
-            tail_off = builder.alloc(&bytes);
+            tail_off = builder.alloc(&bytes)?;
             tail_len = bytes.len() as u8;
             tail_mask = mask;
             if toks.next().is_some() {

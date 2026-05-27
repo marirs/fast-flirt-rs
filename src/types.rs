@@ -46,7 +46,12 @@ pub(crate) struct PatternData {
     /// Offset of the packed name records (laid out as documented on
     /// `NameIter`).
     pub(crate) names_off: u32,
-    pub(crate) names_count: u8,
+    /// `u16` (not `u8`): real FLIRT signatures rarely have more than
+    /// a handful of names, but a crafted `.sig` could silently
+    /// saturate a narrower counter. 65,535 is comfortably more than
+    /// any plausible legitimate corpus and surfaces an error before
+    /// overflow.
+    pub(crate) names_count: u16,
 
     // ---- `.pat`-style contiguous tail ---------------------------
     pub(crate) tail_off: u32,
@@ -55,9 +60,10 @@ pub(crate) struct PatternData {
 
     // ---- `.sig`-style discriminator bytes -----------------------
     /// Offset of packed `(offset_u32_le, value_u8)` records. Each
-    /// record is 5 bytes. `tail_bytes_count` records follow.
+    /// record is 5 bytes. `tail_bytes_count` records follow. `u32`
+    /// (not `u16`) so a crafted module can't silently truncate.
     pub(crate) tail_bytes_off: u32,
-    pub(crate) tail_bytes_count: u16,
+    pub(crate) tail_bytes_count: u32,
 }
 
 // =====================================================================
@@ -235,7 +241,7 @@ pub struct Name<'set> {
 pub struct NameIter<'set> {
     arena: &'set [u8],
     cursor: usize,
-    remaining: u8,
+    remaining: u16,
 }
 
 const NAME_HEADER_LEN: usize = 1 + 8 + 2;
@@ -281,7 +287,7 @@ impl<'set> Iterator for NameIter<'set> {
 pub struct TailByteIter<'set> {
     arena: &'set [u8],
     cursor: usize,
-    remaining: u16,
+    remaining: u32,
 }
 
 const TAIL_BYTE_RECORD_LEN: usize = 4 + 1;
@@ -377,7 +383,7 @@ impl FlirtSet {
                 builder.add_sig(&bytes)?;
             }
         }
-        Ok(builder.build())
+        builder.build()
     }
 }
 
@@ -451,52 +457,135 @@ impl FlirtSetBuilder {
 
     /// Finalize into a queryable [`FlirtSet`]. Builds the prefix trie
     /// over the accumulated patterns.
-    pub fn build(mut self) -> FlirtSet {
+    ///
+    /// Returns an error if any `PatternData` record points at arena
+    /// bytes outside the arena — defensive check that catches both
+    /// arena overflow (which `alloc*` already guards against) and
+    /// any future producer that bypasses the allocators. Real
+    /// parsers never trip this.
+    pub fn build(mut self) -> crate::Result<FlirtSet> {
         // Drop patterns with zero-length leading — they would match
         // anything and confuse the trie. Defensive; the parsers don't
         // produce these.
         self.patterns.retain(|p| p.leading_len > 0);
+        let arena_len = self.arena.len();
+        validate_pattern_offsets(&self.patterns, arena_len)?;
         let arena = self.arena.into_boxed_slice();
         let trie = PatternTrie::build(&self.patterns, &arena);
-        FlirtSet {
+        Ok(FlirtSet {
             arena,
             patterns: self.patterns,
             trie,
+        })
+    }
+}
+
+/// Walk every `PatternData` and confirm each offset+length fits
+/// inside the arena. Returns the first violation as
+/// [`crate::Error::ArenaBounds`]. Linear in the pattern count.
+fn validate_pattern_offsets(patterns: &[PatternData], arena_len: usize) -> crate::Result<()> {
+    for (i, p) in patterns.iter().enumerate() {
+        check_range(
+            i,
+            "leading",
+            p.leading_off,
+            p.leading_len as usize,
+            arena_len,
+        )?;
+        if p.tail_len > 0 {
+            check_range(i, "tail", p.tail_off, p.tail_len as usize, arena_len)?;
+        }
+        if p.names_count > 0 {
+            // Each name record is at least NAME_HEADER_LEN (11) bytes.
+            // The lower-bound check guards `NameIter`'s first slice;
+            // the iterator-walked total length is variable, so the
+            // tighter bound is the slice it takes on each step.
+            // Verify the header of the first record lives in-arena.
+            check_range(
+                i,
+                "names_first_header",
+                p.names_off,
+                NAME_HEADER_LEN,
+                arena_len,
+            )?;
+        }
+        if p.tail_bytes_count > 0 {
+            let total = (p.tail_bytes_count as usize).saturating_mul(TAIL_BYTE_RECORD_LEN);
+            check_range(i, "tail_bytes", p.tail_bytes_off, total, arena_len)?;
         }
     }
+    Ok(())
+}
+
+fn check_range(
+    pattern_idx: usize,
+    field: &'static str,
+    offset: u32,
+    length: usize,
+    arena_len: usize,
+) -> crate::Result<()> {
+    let end = (offset as usize).checked_add(length);
+    if !matches!(end, Some(e) if e <= arena_len) {
+        return Err(crate::Error::ArenaBounds {
+            pattern_idx,
+            field,
+            offset,
+            length,
+            arena_len,
+        });
+    }
+    Ok(())
 }
 
 // ----- Helpers used by both parsers --------------------------------
 
 impl FlirtSetBuilder {
+    /// Reserve space in the arena, surfacing
+    /// [`crate::Error::ArenaOverflow`] if it would push past the
+    /// 4 GiB `u32` ceiling. All `alloc*` helpers route through here.
+    #[inline]
+    fn reserve(&self, additional: usize) -> crate::Result<()> {
+        let current = self.arena.len();
+        if current.saturating_add(additional) > u32::MAX as usize {
+            return Err(crate::Error::ArenaOverflow {
+                current,
+                requested: additional,
+            });
+        }
+        Ok(())
+    }
+
     /// Append `bytes` to the arena and return the offset.
-    pub(crate) fn alloc(&mut self, bytes: &[u8]) -> u32 {
+    pub(crate) fn alloc(&mut self, bytes: &[u8]) -> crate::Result<u32> {
+        self.reserve(bytes.len())?;
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(bytes);
-        off
+        Ok(off)
     }
 
     /// Append a packed name record. Returns the offset of the FIRST
     /// byte of the record so callers can stash it into `names_off`
     /// for the first call of a group.
-    pub(crate) fn alloc_name(&mut self, kind: u8, offset: i64, name: &str) -> u32 {
+    pub(crate) fn alloc_name(&mut self, kind: u8, offset: i64, name: &str) -> crate::Result<u32> {
+        self.reserve(NAME_HEADER_LEN + name.len())?;
         let off = self.arena.len() as u32;
         self.arena.push(kind);
         self.arena.extend_from_slice(&offset.to_le_bytes());
         self.arena
             .extend_from_slice(&(name.len() as u16).to_le_bytes());
         self.arena.extend_from_slice(name.as_bytes());
-        off
+        Ok(off)
     }
 
     /// Append a packed tail-byte record `(offset_le_u32, value_u8)`.
     /// Returns the offset of the first record so the caller stashes
     /// it once for the group.
-    pub(crate) fn alloc_tail_byte(&mut self, offset: u32, value: u8) -> u32 {
+    pub(crate) fn alloc_tail_byte(&mut self, offset: u32, value: u8) -> crate::Result<u32> {
+        self.reserve(TAIL_BYTE_RECORD_LEN)?;
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(&offset.to_le_bytes());
         self.arena.push(value);
-        off
+        Ok(off)
     }
 
     /// Push a fully-constructed `PatternData`. Returns its index in
