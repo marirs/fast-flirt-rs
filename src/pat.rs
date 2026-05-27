@@ -30,17 +30,23 @@
 //! with `#` or `;` are comments.
 
 use crate::error::{Error, Result};
-use crate::types::{Name, Pattern, PatternByte, Symbol};
-use smallvec::SmallVec;
+use crate::types::{FlirtSet, FlirtSetBuilder, NK_LOCAL, NK_PUBLIC, NK_REFERENCE, PatternData};
 
-/// Parse a `.pat` document into a list of [`Pattern`]s.
+/// Parse a `.pat` document into a fully-built [`FlirtSet`].
 ///
-/// Best-effort: malformed lines are returned as errors immediately
-/// (no partial-load semantics) — callers that want lenient loading
-/// can split the input by line and call this per-line. The whole-
-/// file path is preferred because it pre-allocates the result Vec.
-pub fn parse(text: &str) -> Result<Vec<Pattern>> {
-    let mut out = Vec::new();
+/// To merge multiple `.pat`/`.sig` sources into one matcher, use
+/// [`FlirtSetBuilder`] directly and call [`FlirtSetBuilder::add_pat`]
+/// for each input.
+pub fn parse(text: &str) -> Result<FlirtSet> {
+    let mut builder = FlirtSetBuilder::new();
+    append(&mut builder, text)?;
+    Ok(builder.build())
+}
+
+/// Internal: parse `text` and push its patterns onto `builder`'s
+/// running arena. Returns the count of patterns appended.
+pub(crate) fn append(builder: &mut FlirtSetBuilder, text: &str) -> Result<usize> {
+    let mut count = 0;
     for (idx, raw) in text.lines().enumerate() {
         let line = raw.trim_end_matches(['\r']);
         if line.is_empty() {
@@ -62,12 +68,16 @@ pub fn parse(text: &str) -> Result<Vec<Pattern>> {
         if line.starts_with(|c: char| c.is_whitespace()) {
             continue;
         }
-        out.push(parse_line(line, idx + 1)?);
+        parse_line_into(builder, line, idx + 1)?;
+        count += 1;
     }
-    Ok(out)
+    Ok(count)
 }
 
-fn parse_line(line: &str, line_no: usize) -> Result<Pattern> {
+/// Parse one `.pat` line and push the resulting [`PatternData`] onto
+/// `builder`. All hex / wildcard bytes flow into the builder's arena
+/// in the layout described on [`crate::types::PatternData`].
+fn parse_line_into(builder: &mut FlirtSetBuilder, line: &str, line_no: usize) -> Result<()> {
     let mut toks = line.split_ascii_whitespace();
 
     // 1. Head pattern: 32 bytes encoded as 64 hex/wildcard chars.
@@ -77,10 +87,11 @@ fn parse_line(line: &str, line_no: usize) -> Result<Pattern> {
     if head_tok.len() != 64 {
         return Err(Error::BadPatLine(line_no, "head pattern not 64 chars"));
     }
-    let leading = parse_pattern_str(head_tok, line_no)?;
+    let (head_bytes, head_mask) = decode_pattern_str(head_tok, line_no)?;
+    let leading_off = builder.alloc(&head_bytes);
+    let leading_len = head_bytes.len() as u8;
 
-    // 2-4. CRC length, CRC16, module length. All 16-bit fields
-    // encoded as uppercase hex.
+    // 2-4. CRC length, CRC16, module length.
     let crc_len = parse_hex_u8(
         toks.next()
             .ok_or(Error::BadPatLine(line_no, "missing crc_len"))?,
@@ -97,50 +108,46 @@ fn parse_line(line: &str, line_no: usize) -> Result<Pattern> {
         line_no,
     )? as u32;
 
-    // 5+. Names + references, then an optional tail pattern. We
-    // keep reading until we hit a token that doesn't start with
-    // `:` or `^` — that token is either the tail or invalid.
-    let mut names: SmallVec<[Symbol; 2]> = SmallVec::new();
-    let mut tail: Vec<PatternByte> = Vec::new();
+    // 5+. Names + references, then an optional tail pattern.
+    //
+    // We need to know `names_off` (offset of the FIRST name record).
+    // Track it as the offset of the first allocation; subsequent
+    // names extend the contiguous block. Bytes between are nothing —
+    // alloc_name pushes records back-to-back.
+    let mut names_off: u32 = 0;
+    let mut names_count: u8 = 0;
+    let mut tail_off: u32 = 0;
+    let mut tail_len: u8 = 0;
+    let mut tail_mask: u64 = 0;
 
     while let Some(tok) = toks.next() {
         if let Some(rest) = tok.strip_prefix(':') {
-            // `:OFFSET` or `:OFFSET@`.
             let (offset, is_static) = parse_name_offset(rest, line_no)?;
             let name_str = toks
                 .next()
                 .ok_or(Error::BadPatLine(line_no, "missing name after `:OFFSET`"))?;
-            let n = Name {
-                offset,
-                name: name_str.to_string(),
-            };
-            // FLAIR's `@` flag marks the symbol as static / collision-
-            // local; we map that to `Symbol::Local`. Without `@`,
-            // it's the canonical public entry point.
-            names.push(if is_static {
-                Symbol::Local(n)
-            } else {
-                Symbol::Public(n)
-            });
+            let kind = if is_static { NK_LOCAL } else { NK_PUBLIC };
+            let off = builder.alloc_name(kind, offset, name_str);
+            if names_count == 0 {
+                names_off = off;
+            }
+            names_count = names_count.saturating_add(1);
         } else if let Some(rest) = tok.strip_prefix('^') {
-            // `^OFFSET NAME` — reference to an external symbol used
-            // for disambiguating callee names.
             let (offset, _) = parse_name_offset(rest, line_no)?;
             let name_str = toks
                 .next()
                 .ok_or(Error::BadPatLine(line_no, "missing name after `^OFFSET`"))?;
-            names.push(Symbol::Reference(Name {
-                offset,
-                name: name_str.to_string(),
-            }));
+            let off = builder.alloc_name(NK_REFERENCE, offset, name_str);
+            if names_count == 0 {
+                names_off = off;
+            }
+            names_count = names_count.saturating_add(1);
         } else {
-            // Anything else at this point is the tail pattern. It
-            // uses the same hex+wildcard encoding as the head, but
-            // its length is variable (whatever was left of the line
-            // beyond head + CRC window in the original lib function).
-            tail = parse_pattern_str(tok, line_no)?;
-            // Tail is always the last token; if more follow it's a
-            // malformed line.
+            // Tail pattern (last token).
+            let (bytes, mask) = decode_pattern_str(tok, line_no)?;
+            tail_off = builder.alloc(&bytes);
+            tail_len = bytes.len() as u8;
+            tail_mask = mask;
             if toks.next().is_some() {
                 return Err(Error::BadPatLine(line_no, "unexpected token after tail"));
             }
@@ -148,22 +155,27 @@ fn parse_line(line: &str, line_no: usize) -> Result<Pattern> {
         }
     }
 
-    Ok(Pattern {
-        leading,
+    builder.push_pattern(PatternData {
+        leading_off,
+        leading_len,
+        leading_wildmask: head_mask,
         crc_len,
         crc16,
         module_len,
-        names,
-        tail,
-        tail_bytes: Vec::new(),
-    })
+        names_off,
+        names_count,
+        tail_off,
+        tail_len,
+        tail_wildmask: tail_mask,
+        tail_bytes_off: 0,
+        tail_bytes_count: 0,
+    });
+    Ok(())
 }
 
 /// Parse the `OFFSET[@]` substring after `:` or `^`. Returns
 /// (offset, is_static_flag).
 fn parse_name_offset(s: &str, line_no: usize) -> Result<(i64, bool)> {
-    // The `@` suffix (FLAIR's "static" or "weak collision" flag) is
-    // optional. Strip it before hex-decoding the offset.
     let (hex, is_static) = if let Some(stripped) = s.strip_suffix('@') {
         (stripped, true)
     } else {
@@ -174,29 +186,41 @@ fn parse_name_offset(s: &str, line_no: usize) -> Result<(i64, bool)> {
     Ok((off, is_static))
 }
 
-/// Parse a pattern token (sequence of hex pairs and `..` wildcards)
-/// into a `Vec<PatternByte>`. The input length must be even —
-/// odd-length pattern strings are malformed.
-fn parse_pattern_str(s: &str, line_no: usize) -> Result<Vec<PatternByte>> {
+/// Decode a hex+wildcard pattern token into raw bytes + a wildcard
+/// bitmask (bit `i` set ⇒ position `i` is `..`). The byte at a
+/// wildcard position is irrelevant to matching; we leave 0x00.
+///
+/// FLIRT heads are 32 bytes (64 chars) so the mask fits in a u64.
+/// For longer tails we cap the mask at 64 positions — patterns longer
+/// than 64 bytes would lose wildcard info past position 63, but the
+/// FLAIR format itself doesn't produce them.
+fn decode_pattern_str(s: &str, line_no: usize) -> Result<(Vec<u8>, u64)> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return Err(Error::BadPatLine(line_no, "pattern has odd char count"));
     }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let n = bytes.len() / 2;
+    let mut out = Vec::with_capacity(n);
+    let mut mask: u64 = 0;
     let mut i = 0;
+    let mut pos: usize = 0;
     while i < bytes.len() {
         let hi = bytes[i];
         let lo = bytes[i + 1];
         if hi == b'.' && lo == b'.' {
-            out.push(PatternByte::Wildcard);
+            if pos < 64 {
+                mask |= 1u64 << pos;
+            }
+            out.push(0);
         } else {
             let h = hex_nibble(hi).ok_or(Error::BadHex(i, [hi, lo]))?;
             let l = hex_nibble(lo).ok_or(Error::BadHex(i, [hi, lo]))?;
-            out.push(PatternByte::Byte((h << 4) | l));
+            out.push((h << 4) | l);
         }
         i += 2;
+        pos += 1;
     }
-    Ok(out)
+    Ok((out, mask))
 }
 
 #[inline]
@@ -226,69 +250,72 @@ fn parse_hex_u16(s: &str, line_no: usize) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Symbol;
 
     const ONE_LINE: &str = "55564883EC48488D6C24204889CE0F1002488D4D0048895548488D55100F1102 02 ABB7 0040 :0000 __tanq ^0022 __libm___tanq_chosen_core_func ........0F1045004889F00F1106488D65285E5DC3660F1F840000000000";
 
     #[test]
     fn parses_one_pattern() {
-        let p = parse(ONE_LINE).unwrap();
-        assert_eq!(p.len(), 1);
-        let pat = &p[0];
+        let set = parse(ONE_LINE).unwrap();
+        assert_eq!(set.len(), 1);
+        let pat = set.pattern(0);
 
         // Head: 64 chars → 32 bytes. First byte is 0x55, last byte
-        // before the CRC window is 0x02.
-        assert_eq!(pat.leading.len(), 32);
-        assert_eq!(pat.leading[0], PatternByte::Byte(0x55));
-        assert_eq!(pat.leading[31], PatternByte::Byte(0x02));
+        // before the CRC window is 0x02. No wildcards in the head.
+        assert_eq!(pat.leading().len(), 32);
+        assert_eq!(pat.leading()[0], 0x55);
+        assert_eq!(pat.leading()[31], 0x02);
+        assert!(!pat.is_wildcard(0));
+        assert!(!pat.is_wildcard(31));
 
-        assert_eq!(pat.crc_len, 0x02);
-        assert_eq!(pat.crc16, 0xABB7);
-        assert_eq!(pat.module_len, 0x0040);
+        assert_eq!(pat.crc_len(), 0x02);
+        assert_eq!(pat.crc16(), 0xABB7);
+        assert_eq!(pat.module_len(), 0x0040);
 
         // 1 public name + 1 reference.
-        assert_eq!(pat.names.len(), 2);
+        let names: Vec<_> = pat.names().collect();
+        assert_eq!(names.len(), 2);
         assert!(matches!(
-            &pat.names[0],
+            names[0],
             Symbol::Public(n) if n.offset == 0 && n.name == "__tanq"
         ));
         assert!(matches!(
-            &pat.names[1],
+            names[1],
             Symbol::Reference(n)
                 if n.offset == 0x22 && n.name == "__libm___tanq_chosen_core_func"
         ));
 
-        // Tail starts with 4 wildcards (`........`) followed by
-        // 0x0F 0x10 0x45 ...
-        assert!(matches!(pat.tail[0], PatternByte::Wildcard));
-        assert!(matches!(pat.tail[3], PatternByte::Wildcard));
-        assert_eq!(pat.tail[4], PatternByte::Byte(0x0F));
+        // Tail starts with 4 wildcards (`........`) then 0x0F 0x10 0x45...
+        assert!(pat.is_tail_wildcard(0));
+        assert!(pat.is_tail_wildcard(3));
+        assert_eq!(pat.tail()[4], 0x0F);
     }
 
     #[test]
     fn skips_terminator_and_comments() {
         let doc = "# header comment\n; classic FLAIR comment\n---\nbogus line after terminator";
-        let p = parse(doc).unwrap();
-        assert_eq!(p.len(), 0);
+        let set = parse(doc).unwrap();
+        assert_eq!(set.len(), 0);
     }
 
     #[test]
     fn parses_static_at_flag() {
-        // `:0000@` (static / collision) maps to Symbol::Local.
         let line = "55565741544883EC48488D6C24204989CC48630D........488D05........48 0B 5813 00B0 :0000@ __libm___tanq_dispatch_table_init";
-        let p = parse(line).unwrap();
-        assert_eq!(p.len(), 1);
+        let set = parse(line).unwrap();
+        assert_eq!(set.len(), 1);
+        let pat = set.pattern(0);
+        let first = pat.names().next().unwrap();
         assert!(matches!(
-            &p[0].names[0],
+            first,
             Symbol::Local(n) if n.offset == 0 && n.name == "__libm___tanq_dispatch_table_init"
         ));
     }
 
     #[test]
     fn parses_empty_tail() {
-        // `554883EC30...` with no trailing tail pattern.
         let line = "554883EC30488D6C2420E8........3D000C0000743385C074223D0008000075 30 2AF9 0050 :0000 __libm_flt_rounds ^000B fegetround";
-        let p = parse(line).unwrap();
-        assert_eq!(p[0].tail.len(), 0);
+        let set = parse(line).unwrap();
+        assert_eq!(set.pattern(0).tail().len(), 0);
     }
 
     #[test]

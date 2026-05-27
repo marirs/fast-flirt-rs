@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use fast_flirt::{FlirtSet, Pattern, PatternByte};
+use fast_flirt::FlirtSet;
 
 const USAGE: &str = "\
 usage: bench <flirt-corpus-dir> [sample-binary]
@@ -169,27 +169,19 @@ fn count_files(root: &Path) -> usize {
     n
 }
 
-/// Read index distribution without exposing internals: count the
-/// largest bucket, total cross-bucket pattern count, and wildcard
-/// fallback size. We do this by reconstructing the same key the
-/// index uses (the first byte of each pattern's leading head).
+/// First-byte distribution for diagnostic display. Counts patterns
+/// by `leading[0]` value (skipping wildcards at position 0).
 fn index_stats(set: &FlirtSet) -> (usize, usize, usize) {
     let mut counts = [0usize; 256];
     let mut wildcards = 0usize;
     for pat in set.patterns() {
-        match pat.leading.first() {
-            Some(PatternByte::Byte(b)) => counts[*b as usize] += 1,
-            Some(PatternByte::Wildcard) | None => wildcards += 1,
+        if pat.is_wildcard(0) || pat.leading().is_empty() {
+            wildcards += 1;
+        } else {
+            counts[pat.leading()[0] as usize] += 1;
         }
     }
     let max = counts.iter().copied().max().unwrap_or(0);
     let total: usize = counts.iter().sum();
     (max, total, wildcards)
-}
-
-// Touch the Pattern import so unused-import lint doesn't fire on the
-// type-only re-export.
-#[allow(dead_code)]
-fn _ty_check() -> Option<&'static Pattern> {
-    None
 }
