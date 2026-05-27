@@ -64,7 +64,7 @@ pub fn parse_gz(bytes: &[u8]) -> Result<FlirtSet> {
 pub(crate) fn append_gz(builder: &mut FlirtSetBuilder, bytes: &[u8]) -> Result<usize> {
     let deflate = strip_gz_header(bytes)?;
     let decompressed = miniz_oxide::inflate::decompress_to_vec(deflate)
-        .map_err(|e| Error::PatGz(format!("inflate failed: {:?}", e.status)))?;
+        .map_err(|e| Error::PatGz(format!("inflate failed: {:?}", e)))?;
     let text = std::str::from_utf8(&decompressed)
         .map_err(|e| Error::PatGz(format!("decompressed body not utf-8: {e}")))?;
     append(builder, text)
