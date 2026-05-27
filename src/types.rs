@@ -449,6 +449,17 @@ impl FlirtSetBuilder {
         crate::pat::append(self, text)
     }
 
+    /// 0.2.2: parse a gzip-wrapped `.pat.gz` document and append its
+    /// patterns. Returns the number of patterns added.
+    ///
+    /// Many FLARE-distributed `.pat` files ship as `.pat.gz` to save
+    /// bandwidth. Pure-Rust gunzip — gzip framing is stripped here
+    /// and the deflate stream is inflated via `miniz_oxide`. No C
+    /// dependency, no `flate2`.
+    pub fn add_pat_gz(&mut self, bytes: &[u8]) -> crate::Result<usize> {
+        crate::pat::append_gz(self, bytes)
+    }
+
     /// Parse a `.sig` file (compressed or not) and append its
     /// patterns. Returns the number of patterns added.
     pub fn add_sig(&mut self, bytes: &[u8]) -> crate::Result<usize> {

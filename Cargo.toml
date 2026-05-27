@@ -1,6 +1,6 @@
 [package]
 name = "fast-flirt"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fast, thread-safe FLIRT (Fast Library Identification and Recognition Technology) signature parser and matcher."
 authors = ["Marirs <marirs@gmail.com>"]
 keywords = ["flirt", "flare", "malware", "reverse-engineering", "signatures"]

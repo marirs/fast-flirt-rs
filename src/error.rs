@@ -120,6 +120,13 @@ pub enum Error {
     /// (limit: `u32::MAX`). See `TooManyNames`.
     #[error("too many tail_bytes on pattern at offset {pos} (max {max})")]
     TooManyTailBytes { pos: usize, max: u32 },
+
+    /// `.pat.gz` input failed gzip framing or deflate decode. Catches
+    /// truncated headers, bad magic, unsupported compression method,
+    /// and miniz_oxide inflate errors with one variant — the body
+    /// describes the specific reason. (0.2.2: `.pat.gz` decoding.)
+    #[error("`.pat.gz` decode failed: {0}")]
+    PatGz(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

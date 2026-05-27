@@ -43,6 +43,117 @@ pub fn parse(text: &str) -> Result<FlirtSet> {
     builder.build()
 }
 
+/// 0.2.2: parse a gzip-wrapped `.pat.gz` document into a fully-built
+/// [`FlirtSet`]. FLARE distributes many `.pat` files as `.pat.gz` to
+/// save bandwidth; consumers used to have to `gunzip` ahead of time.
+///
+/// Pure-Rust: gz framing is stripped manually (header + trailer per
+/// RFC 1952); the deflate stream is inflated via `miniz_oxide`. No C
+/// dependency, no `flate2`.
+///
+/// For incremental loading into a shared builder, use
+/// [`FlirtSetBuilder::add_pat_gz`].
+pub fn parse_gz(bytes: &[u8]) -> Result<FlirtSet> {
+    let mut builder = FlirtSetBuilder::new();
+    append_gz(&mut builder, bytes)?;
+    builder.build()
+}
+
+/// Internal: gunzip `bytes` and append the resulting `.pat` text to
+/// `builder`'s arena. Returns the count of patterns appended.
+pub(crate) fn append_gz(builder: &mut FlirtSetBuilder, bytes: &[u8]) -> Result<usize> {
+    let deflate = strip_gz_header(bytes)?;
+    let decompressed = miniz_oxide::inflate::decompress_to_vec(deflate)
+        .map_err(|e| Error::PatGz(format!("inflate failed: {:?}", e.status)))?;
+    let text = std::str::from_utf8(&decompressed)
+        .map_err(|e| Error::PatGz(format!("decompressed body not utf-8: {e}")))?;
+    append(builder, text)
+}
+
+/// Strip a gzip header (RFC 1952) and the trailing CRC32 + ISIZE
+/// footer (8 bytes), returning the inner deflate stream.
+///
+/// Vendor-shipped FLARE `.pat.gz` files use the minimal header (no
+/// FEXTRA / FNAME / FCOMMENT / FHCRC), but the optional fields are
+/// handled here for robustness against community sources.
+fn strip_gz_header(input: &[u8]) -> Result<&[u8]> {
+    // Minimum gz size: 10-byte header + 8-byte trailer + at least an
+    // empty deflate block (2 bytes).
+    if input.len() < 20 {
+        return Err(Error::PatGz(format!(
+            "input too short for gzip framing: {} bytes",
+            input.len()
+        )));
+    }
+    if input[0] != 0x1f || input[1] != 0x8b {
+        return Err(Error::PatGz(format!(
+            "bad gzip magic: 0x{:02x} 0x{:02x} (expected 0x1f 0x8b)",
+            input[0], input[1]
+        )));
+    }
+    if input[2] != 8 {
+        return Err(Error::PatGz(format!(
+            "unsupported compression method {} (only deflate=8 supported)",
+            input[2]
+        )));
+    }
+    let flg = input[3];
+    let mut off: usize = 10;
+
+    // FEXTRA: 2-byte XLEN + XLEN extra bytes
+    if flg & 0x04 != 0 {
+        if off + 2 > input.len() {
+            return Err(Error::PatGz("truncated FEXTRA length".into()));
+        }
+        let xlen = u16::from_le_bytes([input[off], input[off + 1]]) as usize;
+        off = off
+            .checked_add(2)
+            .and_then(|o| o.checked_add(xlen))
+            .ok_or_else(|| Error::PatGz("FEXTRA overflow".into()))?;
+        if off > input.len() {
+            return Err(Error::PatGz("truncated FEXTRA body".into()));
+        }
+    }
+    // FNAME: null-terminated original filename
+    if flg & 0x08 != 0 {
+        while off < input.len() && input[off] != 0 {
+            off += 1;
+        }
+        if off >= input.len() {
+            return Err(Error::PatGz("truncated FNAME (no null)".into()));
+        }
+        off += 1; // skip the null
+    }
+    // FCOMMENT: null-terminated comment
+    if flg & 0x10 != 0 {
+        while off < input.len() && input[off] != 0 {
+            off += 1;
+        }
+        if off >= input.len() {
+            return Err(Error::PatGz("truncated FCOMMENT (no null)".into()));
+        }
+        off += 1;
+    }
+    // FHCRC: 2-byte header CRC16 (we don't verify — non-critical for
+    // signature-corpus use)
+    if flg & 0x02 != 0 {
+        if off + 2 > input.len() {
+            return Err(Error::PatGz("truncated FHCRC".into()));
+        }
+        off += 2;
+    }
+
+    // Trailer is 8 bytes (CRC32 + ISIZE). miniz_oxide stops at end of
+    // deflate stream and tolerates trailing bytes, but trimming makes
+    // the contract explicit and lets us validate framing length.
+    if input.len() < off + 8 {
+        return Err(Error::PatGz(
+            "no room for deflate body after header + trailer".into(),
+        ));
+    }
+    Ok(&input[off..input.len() - 8])
+}
+
 /// Internal: parse `text` and push its patterns onto `builder`'s
 /// running arena. Returns the count of patterns appended.
 pub(crate) fn append(builder: &mut FlirtSetBuilder, text: &str) -> Result<usize> {
